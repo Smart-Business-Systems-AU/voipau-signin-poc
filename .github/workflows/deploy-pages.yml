@@ -1,0 +1,83 @@
+# Builds the Horizon remote from main, runs the platform's bundle checks, and
+# publishes dist/ (including source maps) to GitHub Pages. dist/ is never
+# committed: the only way to publish is to push source that builds and verifies.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Build variant'
+        type: choice
+        options: [full, broker-only]
+        default: full
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race — a half-overwritten publish makes every Horizon
+# host fail its integrity check at once.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # the version guard diffs against the previous commit
+
+      # Horizon pins a hash of the bytes it verified at a stable URL. New bytes
+      # under an unchanged version make the app silently stop loading.
+      - name: Refuse to ship changed bytes under an unchanged version
+        run: |
+          PREV=$(git show HEAD~1:package.json 2>/dev/null | node -p "try{JSON.parse(require('fs').readFileSync(0,'utf8')).version}catch(e){''}" || echo "")
+          THIS=$(node -p "require('./package.json').version")
+          [ -z "$PREV" ] && exit 0
+          [ "$PREV" != "$THIS" ] && exit 0
+          git diff --quiet HEAD~1 HEAD -- src webpack.config.js package.json package-lock.json && exit 0
+          echo "::error::Bundle inputs changed but the version is still $THIS. Bump it."
+          exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+
+      - name: Build
+        run: |
+          if [ "${{ inputs.variant }}" = "broker-only" ]; then
+            npm run build:broker-only
+          else
+            npm run build
+          fi
+
+      # The same checks the platform runs on submission.
+      - run: npm run verify
+
+      # Jekyll strips files starting with "_"; bypass it.
+      - run: touch dist/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
